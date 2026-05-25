@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Tencent. All rights reserved.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
-# shellcheck source=./coredns-compose-lib.sh
-source "${SCRIPT_DIR}/coredns-compose-lib.sh"
 
 require_root
-require_cmd docker
 require_cmd ip
 
 COREDNS_DIR="${TOOLBOX_ROOT}/coredns"
-COREDNS_CONTAINER="${CUBE_PROXY_COREDNS_CONTAINER:-cube-proxy-coredns}"
 DNS_MODE_FILE="${COREDNS_DIR}/host-dns-mode"
 DNS_IFACE_FILE="${COREDNS_DIR}/host-dns-interface"
 NM_MAIN_CONF="/etc/NetworkManager/conf.d/90-cubeproxy-dns.conf"
@@ -24,23 +22,21 @@ networkmanager_available() {
 }
 
 link_exists() {
-  local link_name="$1"
-  ip link show dev "${link_name}" >/dev/null 2>&1
+  ip link show dev "$1" >/dev/null 2>&1
 }
 
 link_is_dummy() {
-  local link_name="$1"
   local link_details
-  link_details="$(ip -d link show dev "${link_name}" 2>/dev/null || true)"
+  link_details="$(ip -d link show dev "$1" 2>/dev/null || true)"
   [[ "${link_details}" == *" dummy "* || "${link_details}" == *"dummy "* ]]
 }
 
 is_stub_nameserver() {
   local nameserver="$1"
   [[ -n "${nameserver}" ]] || return 0
-  [[ "${nameserver}" == "127."* ]] && return 0
-  [[ "${nameserver}" == "::1" ]] && return 0
-  [[ "${nameserver}" == "0:0:0:0:0:0:0:1" ]] && return 0
+  [[ "${nameserver}" == 127.* ]] && return 0
+  [[ "${nameserver}" == ::1 ]] && return 0
+  [[ "${nameserver}" == 0:0:0:0:0:0:0:1 ]] && return 0
   return 1
 }
 
@@ -50,7 +46,6 @@ copy_non_stub_resolv_conf_if_needed() {
   local found_nameserver=1
 
   [[ -f "${src_path}" ]] || return 1
-
   : > "${tmp_path}"
   while IFS= read -r line || [[ -n "${line}" ]]; do
     case "${line}" in
@@ -94,7 +89,6 @@ restore_non_stub_resolv_conf() {
   if [[ -f /etc/resolv.conf ]]; then
     current_nameserver="$(awk '/^nameserver[[:space:]]+/ {print $2; exit}' /etc/resolv.conf)"
   fi
-
   if [[ -n "${current_nameserver}" ]] && ! is_stub_nameserver "${current_nameserver}"; then
     return 0
   fi
@@ -102,62 +96,40 @@ restore_non_stub_resolv_conf() {
   local src_path
   for src_path in "${candidates[@]}"; do
     if copy_non_stub_resolv_conf_if_needed "${src_path}"; then
-      log "restored host resolv.conf from ${src_path}"
       return 0
     fi
   done
-
-  log "host resolv.conf still points to a stub resolver; no non-stub backup was available"
 }
 
-rollback_host_dns() {
-  local mode=""
-  local iface=""
-  [[ -f "${DNS_MODE_FILE}" ]] && mode="$(<"${DNS_MODE_FILE}")"
-  [[ -f "${DNS_IFACE_FILE}" ]] && iface="$(<"${DNS_IFACE_FILE}")"
+mode=""
+iface=""
+[[ -f "${DNS_MODE_FILE}" ]] && mode="$(<"${DNS_MODE_FILE}")"
+[[ -f "${DNS_IFACE_FILE}" ]] && iface="$(<"${DNS_IFACE_FILE}")"
 
-  case "${mode}" in
-    systemd-resolved)
-      if [[ -n "${iface}" ]] && command -v resolvectl >/dev/null 2>&1; then
-        resolvectl revert "${iface}" >/dev/null 2>&1 || true
-      fi
-      if [[ -n "${iface}" ]] && link_exists "${iface}" && link_is_dummy "${iface}"; then
-        ip link delete "${iface}" >/dev/null 2>&1 || true
-      fi
-      ;;
-    networkmanager-dnsmasq)
-      rm -f "${NM_DOMAIN_CONF}" "${NM_MAIN_CONF}"
-      if networkmanager_available; then
-        systemctl restart NetworkManager >/dev/null 2>&1 || true
-      fi
-      # Restore /etc/resolv.conf in case NM is not yet ready to repopulate it.
-      # With rc-manager back to its default after the conf removal+restart,
-      # NM will normally rewrite resolv.conf itself, but this is the safety net.
-      restore_non_stub_resolv_conf
-      # The NM path now uses the same dummy link as the systemd-resolved
-      # path to host dnsmasq, so tear it down here as well.
-      if [[ -n "${iface}" ]] && link_exists "${iface}" && link_is_dummy "${iface}"; then
-        ip link delete "${iface}" >/dev/null 2>&1 || true
-      fi
-      ;;
-    "" )
-      ;;
-    * )
-      log "skip unknown dns mode rollback: ${mode}"
-      ;;
-  esac
+case "${mode}" in
+  systemd-resolved)
+    if [[ -n "${iface}" ]] && command -v resolvectl >/dev/null 2>&1; then
+      resolvectl revert "${iface}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${iface}" ]] && link_exists "${iface}" && link_is_dummy "${iface}"; then
+      ip link delete "${iface}" >/dev/null 2>&1 || true
+    fi
+    ;;
+  networkmanager-dnsmasq)
+    rm -f "${NM_DOMAIN_CONF}" "${NM_MAIN_CONF}"
+    if networkmanager_available; then
+      systemctl restart NetworkManager >/dev/null 2>&1 || true
+    fi
+    # Restore /etc/resolv.conf in case NM is not yet ready to repopulate it.
+    # With rc-manager back to its default after the conf removal+restart,
+    # NM will normally rewrite resolv.conf itself, but this is the safety net.
+    restore_non_stub_resolv_conf
+    # The NM path now uses the same dummy link as the systemd-resolved
+    # path to host dnsmasq, so tear it down here as well.
+    if [[ -n "${iface}" ]] && link_exists "${iface}" && link_is_dummy "${iface}"; then
+      ip link delete "${iface}" >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
 
-  rm -f "${DNS_MODE_FILE}" "${DNS_IFACE_FILE}"
-}
-
-if [[ -f "${COREDNS_DIR}/docker-compose.yaml" ]]; then
-  coredns_compose_run down --remove-orphans >/dev/null 2>&1 || true
-fi
-
-if container_exists "${COREDNS_CONTAINER}"; then
-  docker rm -f "${COREDNS_CONTAINER}" >/dev/null
-fi
-
-rollback_host_dns
-
-log "cube proxy dns stopped"
+rm -f "${DNS_MODE_FILE}" "${DNS_IFACE_FILE}"
