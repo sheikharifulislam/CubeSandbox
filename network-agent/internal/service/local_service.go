@@ -68,6 +68,10 @@ type localService struct {
 	abnormalTapPool   []*tapDevice
 	quarantinedTaps   map[string]*tapDevice
 	destroyFailedTaps map[string]*tapDevice
+	// creating tracks sandbox IDs whose network is being created but not yet
+	// committed into states. ReleaseNetwork waits on the channel so it never
+	// races ahead of an in-flight creation and orphans the freshly built tap.
+	creating map[string]chan struct{}
 
 	version uint32
 
@@ -156,6 +160,7 @@ func NewLocalService(cfg Config) (Service, error) {
 		abnormalTapPool:   make([]*tapDevice, 0),
 		quarantinedTaps:   make(map[string]*tapDevice),
 		destroyFailedTaps: make(map[string]*tapDevice),
+		creating:          make(map[string]chan struct{}),
 		egress:            newEgressClientFromConfig(cfg),
 	}
 	if err := s.recover(); err != nil {
@@ -184,19 +189,64 @@ func (s *localService) EnsureNetwork(ctx context.Context, req *EnsureNetworkRequ
 		req.PersistMetadata,
 	)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Fast path: already created. The common idempotent re-request returns its
+	// own response clone (ensureResponse copies all slices/maps) without doing
+	// any creation work.
 	if existing, ok := s.states[req.SandboxID]; ok {
-		return existing.ensureResponse(), nil
+		resp := existing.ensureResponse()
+		s.mu.Unlock()
+		return resp, nil
 	}
-	state, err := s.createStateLocked(ctx, req)
-	if err != nil {
-		return nil, err
+	// Deduplicate concurrent creates for the same sandbox: if one is already in
+	// flight, wait on its guard channel and then return the committed state.
+	if done, ok := s.creating[req.SandboxID]; ok {
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+		existing, ok := s.states[req.SandboxID]
+		s.mu.Unlock()
+		if ok {
+			return existing.ensureResponse(), nil
+		}
+		return nil, fmt.Errorf("concurrent network creation for sandbox %q failed", req.SandboxID)
 	}
-	s.states[state.SandboxID] = state
+	// We are the creator. Register the guard in the SAME critical section as the
+	// states/creating check, before unlocking. This closes the TOCTOU window
+	// where ReleaseNetwork could observe neither states[id] nor creating[id] and
+	// return a no-op release, orphaning the tap this call is about to build.
+	// Different sandbox IDs still run fully in parallel: the heavy work (tap
+	// creation, eBPF/cubevs map updates, state persistence) happens outside the
+	// global mutex inside createState.
+	if s.creating == nil {
+		s.creating = make(map[string]chan struct{})
+	}
+	done := make(chan struct{})
+	s.creating[req.SandboxID] = done
+	s.mu.Unlock()
+
+	state, createErr := s.createState(ctx, req)
+
+	s.mu.Lock()
+	delete(s.creating, req.SandboxID)
+	if createErr == nil {
+		s.states[state.SandboxID] = state
+	}
+	close(done)
+	s.mu.Unlock()
+	if createErr != nil {
+		return nil, createErr
+	}
 	return state.ensureResponse(), nil
 }
 
 func (s *localService) ReleaseNetwork(ctx context.Context, req *ReleaseNetworkRequest) (*ReleaseNetworkResponse, error) {
+	// If a creation for this sandbox is in flight, wait for it to finish before
+	// looking up the state. Otherwise we could observe "not found" while a tap
+	// is being built and return a no-op release, orphaning that tap. This
+	// reproduces the old global-lock mutual exclusion between Ensure and Release
+	// for the same sandbox without serializing unrelated sandboxes.
+	s.waitForInflightCreation(req.SandboxID, req.NetworkHandle)
+
 	s.mu.Lock()
 	state, ok := s.lookupStateLocked(req.SandboxID, req.NetworkHandle)
 	if !ok {
@@ -293,48 +343,35 @@ func (s *localService) Health(ctx context.Context) error {
 	return nil
 }
 
-func (s *localService) createStateLocked(ctx context.Context, req *EnsureNetworkRequest) (*managedState, error) {
+// createState builds the network for a sandbox. It does NOT hold s.mu across
+// the heavy work: the global mutex is only taken briefly inside acquireTap /
+// releaseAcquiredTap / cleanupConflictingTap to mutate the in-memory pools and
+// collections. The expensive tap creation, eBPF/cubevs map updates and state
+// persistence all run lock-free and operate on resources unique to this tap
+// (distinct ifindex/IP/host-port/state file), so concurrent createState calls
+// for different sandboxes proceed in parallel.
+//
+// ctx is currently only used for logging: the underlying netlink/eBPF calls do
+// not accept a context, so a cancelled/timed-out client does not abort an
+// in-flight creation. ReleaseNetwork therefore waits on the creating guard to
+// avoid orphaning a tap that is still being built.
+func (s *localService) createState(ctx context.Context, req *EnsureNetworkRequest) (*managedState, error) {
 	if err := s.ensureHostRoute(); err != nil {
 		return nil, err
 	}
 	requestedMappings := s.normalizePortMappings(req.PortMappings)
-	tap := s.dequeueTapLocked()
-	fromPool := tap != nil
-	if !fromPool {
-		ip, err := s.allocator.Allocate()
-		if err != nil {
-			return nil, err
-		}
-		if err := s.cleanupConflictingTap(ip); err != nil {
-			s.allocator.Release(ip)
-			return nil, err
-		}
-		tap, err = newTapFunc(ip, s.cfg.MVMMacAddr, s.cfg.MvmMtu, s.cubeDev.Index)
-		if err != nil {
-			s.allocator.Release(ip)
-			return nil, err
-		}
+	tap, fromPool, err := s.acquireTap()
+	if err != nil {
+		return nil, err
 	}
 	actualMappings, err := s.configurePortMappings(tap, requestedMappings)
 	if err != nil {
-		if fromPool {
-			s.recycleTapLocked(tap)
-		} else {
-			closeTapFile(tap.File)
-			_ = destroyTapFunc(tap.Index)
-			s.allocator.Release(tap.IP)
-		}
+		s.releaseAcquiredTap(tap, fromPool)
 		return nil, err
 	}
 	if err := s.registerCubeVSTap(tap.Index, tap.IP, req.SandboxID, req.CubeNetworkConfig); err != nil {
 		s.clearPortMappings(tap)
-		if fromPool {
-			s.recycleTapLocked(tap)
-		} else {
-			closeTapFile(tap.File)
-			_ = destroyTapFunc(tap.Index)
-			s.allocator.Release(tap.IP)
-		}
+		s.releaseAcquiredTap(tap, fromPool)
 		return nil, err
 	}
 	state := &managedState{
@@ -355,15 +392,14 @@ func (s *localService) createStateLocked(ctx context.Context, req *EnsureNetwork
 		policyKnown: true,
 	}
 	if err := s.store.Save(&state.persistedState); err != nil {
-		_ = cubevsDelTAPDevice(uint32(tap.Index), tap.IP.To4())
-		s.clearPortMappings(tap)
-		if fromPool {
-			s.recycleTapLocked(tap)
-		} else {
-			closeTapFile(tap.File)
-			_ = destroyTapFunc(tap.Index)
-			s.allocator.Release(tap.IP)
+		if delErr := cubevsDelTAPDevice(uint32(tap.Index), tap.IP.To4()); delErr != nil {
+			CubeLog.WithContext(ctx).Warnf(
+				"network-agent createState rollback: cubevs del tap failed (stale eBPF entries may leak): sandbox_id=%s ifindex=%d ip=%s err=%v",
+				req.SandboxID, tap.Index, tap.IP.String(), delErr,
+			)
 		}
+		s.clearPortMappings(tap)
+		s.releaseAcquiredTap(tap, fromPool)
 		return nil, err
 	}
 	// Push the L7 egress policy to CubeEgress's admin API. Best-effort:
@@ -375,6 +411,51 @@ func (s *localService) createStateLocked(ctx context.Context, req *EnsureNetwork
 	// sandbox-creation failure, which is the wrong trade-off.
 	s.pushEgressForState(ctx, state)
 	return state, nil
+}
+
+// acquireTap obtains a tap for a new sandbox, preferring the free pool. The
+// global mutex is only held for the pool dequeue and the conflict membership
+// check; IP allocation and the heavy newTap syscalls run lock-free. The boolean
+// return reports whether the tap came from the pool, which determines how it is
+// rolled back on failure.
+func (s *localService) acquireTap() (*tapDevice, bool, error) {
+	s.mu.Lock()
+	tap := s.dequeueTapLocked()
+	s.mu.Unlock()
+	if tap != nil {
+		return tap, true, nil
+	}
+	ip, err := s.allocator.Allocate()
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.cleanupConflictingTap(ip); err != nil {
+		s.allocator.Release(ip)
+		return nil, false, err
+	}
+	tap, err = newTapFunc(ip, s.cfg.MVMMacAddr, s.cfg.MvmMtu, s.cubeDev.Index)
+	if err != nil {
+		s.allocator.Release(ip)
+		return nil, false, err
+	}
+	return tap, false, nil
+}
+
+// releaseAcquiredTap rolls back a tap obtained via acquireTap when a later
+// creation step fails. Pool taps are recycled back into the pool (their IP stays
+// allocated for reuse); freshly created taps are destroyed and their IP freed.
+// Callers must perform stage-specific compensation (clearPortMappings,
+// cubevsDelTAPDevice) before calling this.
+func (s *localService) releaseAcquiredTap(tap *tapDevice, fromPool bool) {
+	if fromPool {
+		s.mu.Lock()
+		s.recycleTapLocked(tap)
+		s.mu.Unlock()
+		return
+	}
+	closeTapFile(tap.File)
+	_ = destroyTapFunc(tap.Index)
+	s.allocator.Release(tap.IP)
 }
 
 func (s *localService) reconcileState(ctx context.Context, state *managedState) error {
@@ -607,6 +688,13 @@ func (s *localService) recover() error {
 	return nil
 }
 
+// cleanupConflictingTap destroys a stale host tap that collides with a freshly
+// allocated IP. It must be called without holding s.mu: the netlink list and the
+// destroy syscall run lock-free, while the membership checks against the
+// in-memory collections are performed under s.mu. The IP is already exclusively
+// owned by the caller (handed out by the allocator) and tap names derive
+// uniquely from the IP, so no other goroutine can re-reference this tap between
+// the check and the destroy.
 func (s *localService) cleanupConflictingTap(ip net.IP) error {
 	taps, err := listCubeTapsFunc()
 	if err != nil {
@@ -616,6 +704,22 @@ func (s *localService) cleanupConflictingTap(ip net.IP) error {
 	if !ok {
 		return nil
 	}
+	if err := s.checkTapConflict(tap, ip); err != nil {
+		return err
+	}
+	if err := destroyTapFunc(tap.Index); err != nil {
+		return fmt.Errorf("destroy stale tap %s(%d): %w", tap.Name, tap.Index, err)
+	}
+	return nil
+}
+
+// checkTapConflict reports an error if the given tap is still referenced by any
+// in-memory collection (active states or any of the pools). It acquires s.mu
+// itself for the duration of the scan, so callers must NOT already hold it
+// (hence no "Locked" suffix, which would imply the opposite).
+func (s *localService) checkTapConflict(tap *tapDevice, ip net.IP) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, state := range s.states {
 		if state.TapName == tap.Name || state.SandboxIP == ip.String() {
 			return fmt.Errorf("tap %s(%d) is still allocated to sandbox %s", tap.Name, tap.Index, state.SandboxID)
@@ -635,9 +739,6 @@ func (s *localService) cleanupConflictingTap(ip net.IP) error {
 		if quarantinedTap != nil && (quarantinedTap.Name == tap.Name || quarantinedTap.IP.Equal(ip)) {
 			return fmt.Errorf("tap %s(%d) is quarantined and unavailable for reuse", tap.Name, tap.Index)
 		}
-	}
-	if err := destroyTapFunc(tap.Index); err != nil {
-		return fmt.Errorf("destroy stale tap %s(%d): %w", tap.Name, tap.Index, err)
 	}
 	return nil
 }
@@ -1015,6 +1116,24 @@ func (s *localService) startProxies(state *managedState) error {
 		state.proxies = append(state.proxies, proxy)
 	}
 	return nil
+}
+
+// waitForInflightCreation blocks until any in-flight createState for the given
+// sandbox ID or network handle has committed (or failed). It must be called
+// without holding s.mu.
+func (s *localService) waitForInflightCreation(sandboxID, networkHandle string) {
+	s.mu.Lock()
+	var done chan struct{}
+	if sandboxID != "" {
+		done = s.creating[sandboxID]
+	}
+	if done == nil && networkHandle != "" {
+		done = s.creating[networkHandle]
+	}
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 func (s *localService) lookupStateLocked(sandboxID, networkHandle string) (*managedState, bool) {
