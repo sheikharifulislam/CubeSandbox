@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/errorcode"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/httpservice/common"
@@ -61,26 +62,22 @@ type deleteTemplateRequest struct {
 	Sync         bool   `json:"sync,omitempty"`
 }
 
-func handleTemplateAction(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	switch r.Method {
-	case http.MethodPost:
-		return createTemplate(w, r, rt)
-	case http.MethodGet:
-		return getTemplate(w, r, rt)
-	case http.MethodDelete:
-		return deleteTemplate(w, r, rt)
-	default:
-		return &types.Res{
-			Ret: &types.Ret{
-				RetCode: int(errorcode.ErrorCode_MasterParamsError),
-				RetMsg:  http.StatusText(http.StatusMethodNotAllowed),
-			},
-		}
-	}
+func createTemplateGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	common.WriteAPI(c, createTemplate(c.Request, rt))
 }
 
-func deleteTemplate(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	_ = w
+func getTemplateGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	common.WriteAPI(c, getTemplate(c.Request, rt))
+}
+
+func deleteTemplateGinHandler(c *gin.Context) {
+	rt := CubeLog.GetTraceInfo(c.Request.Context())
+	common.WriteAPI(c, deleteTemplate(c.Request, rt))
+}
+
+func deleteTemplate(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	req := &deleteTemplateRequest{}
 	if err := common.GetBodyReq(r, req); err != nil {
 		return &templateResponse{
@@ -146,8 +143,7 @@ func deleteTemplate(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestT
 	}
 }
 
-func createTemplate(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	_ = w
+func createTemplate(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	req, err := constructCreateReq(r)
 	if err != nil {
 		return &templateResponse{
@@ -208,8 +204,7 @@ func createTemplate(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestT
 	}
 }
 
-func getTemplate(w http.ResponseWriter, r *http.Request, rt *CubeLog.RequestTrace) interface{} {
-	_ = w
+func getTemplate(r *http.Request, rt *CubeLog.RequestTrace) interface{} {
 	templateID := r.URL.Query().Get("template_id")
 	includeRequest := r.URL.Query().Get("include_request") == "true" || r.URL.Query().Get("include_request") == "1"
 	if templateID == "" {
