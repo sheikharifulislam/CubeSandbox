@@ -18,10 +18,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tencentcloud/CubeSandbox/CubeDB/dao"
+	_ "github.com/tencentcloud/CubeSandbox/CubeDB/dao/driver/mysql"    // register mysql driver
+	_ "github.com/tencentcloud/CubeSandbox/CubeDB/dao/driver/postgres" // register postgres driver
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/config"
-	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/dao"
-	_ "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/dao/driver/mysql"    // register mysql driver
-	_ "github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/dao/driver/postgres" // register postgres driver
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/recov"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/cubelet/grpcconn"
@@ -197,7 +197,7 @@ func coreInit(ctx context.Context, cfg *config.Config) error {
 // process; whoever loses the lock race blocks until the winner is done,
 // then sees the schema is already at HEAD and returns immediately.
 func initDatabaseSchema(ctx context.Context, cfg *config.Config) error {
-	// The schema produced by pkg/base/dao/migrate/migrations is a single
+	// The schema produced by CubeDB/migrate/migrations is a single
 	// catalog covering both the OSS-side tables (t_cube_host_*, t_cube_node_*,
 	// ...) and the instance-side tables (t_cube_template_*, t_cube_instance_*,
 	// t_cube_sandbox_spec, ...). Running migrations against only one of the
